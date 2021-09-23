@@ -317,7 +317,7 @@ end = struct
 
   exception Finished of process * Unix.process_status
 
-  let wait_nonblocking_win32 t =
+  let wait_nonblocking t =
     try
       Process_table.iter t ~f:(fun job ->
           let pid, status = Unix.waitpid [ WNOHANG ] (Pid.to_int job.pid) in
@@ -331,33 +331,41 @@ end = struct
       true
 
   let wait_win32 t =
-    while not (wait_nonblocking_win32 t) do
+    while not (wait_nonblocking t) do
       Mutex.unlock t.mutex;
       Thread.delay 0.001;
       Mutex.lock t.mutex
     done
 
-  let wait_unix t =
-    Mutex.unlock t.mutex;
-    let pid, status = Unix.wait () in
-    Mutex.lock t.mutex;
-    let pid = Pid.of_int pid in
-    Process_table.remove t ~pid status
+  let start_watching_win32 t =
+    let f () =
+      Mutex.lock t.mutex;
+      while true do
+        while Process_table.running_count t = 0 do
+          Condition.wait t.something_is_running t.mutex
+        done;
+        wait_win32 t
+      done
+    in
+    ignore (Thread.create f () : Thread.t)
 
-  let wait =
+  let old_sigchld_behavior = ref None
+
+  let start_watching_unix t =
+    let sig_handler _sig =
+      Mutex.lock t.mutex;
+      while wait_nonblocking t do () done;
+      Mutex.unlock t.mutex
+    in
+    let old = Sys.signal Sys.sigchld (Sys.Signal_handle sig_handler) in
+    old_sigchld_behavior := Some old;
+    ()
+
+  let start_watching t =
     if Sys.win32 then
-      wait_win32
+      start_watching_win32 t
     else
-      wait_unix
-
-  let run t =
-    Mutex.lock t.mutex;
-    while true do
-      while Process_table.running_count t = 0 do
-        Condition.wait t.something_is_running t.mutex
-      done;
-      wait t
-    done
+      start_watching_unix t
 
   let init process_scheduler =
     let t =
@@ -368,7 +376,7 @@ end = struct
       ; process_scheduler
       }
     in
-    ignore (Thread.create run t : Thread.t);
+    start_watching t;
     t
 end
 
